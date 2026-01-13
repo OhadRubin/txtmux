@@ -8,6 +8,8 @@ from textual.binding import Binding
 from textual.widgets import Header, Static, Tabs, Tab
 from textual.message import Message as TextualMessage
 from textual import events
+from textual.reactive import reactive
+from textual.containers import Horizontal
 
 from txtmux.terminal_widget import TerminalPane
 from txtmux.protocol import (
@@ -18,29 +20,75 @@ from txtmux.protocol import (
     decode_session_info,
     MessageType,
 )
+from txtmux.constants import DEFAULT_TERMINAL_WIDTH, DEFAULT_TERMINAL_HEIGHT
 
 
-class StatusBar(Static):
-    """Minimal status bar: session name (left) + detach hint (right)."""
+class EnhancedStatusBar(Static):
+    """Rich status bar with reactive properties for automatic updates."""
 
-    def __init__(self, session_name: str) -> None:
+    session_name: reactive[str] = reactive("")
+    session_id: reactive[int] = reactive(0)
+    connected: reactive[bool] = reactive(True)
+
+    def __init__(self, session_name: str, session_id: int) -> None:
         super().__init__()
         self.session_name = session_name
+        self.session_id = session_id
 
     def compose(self) -> ComposeResult:
-        yield Static(f" {self.session_name}", id="status-left")
-        yield Static("Ctrl+B D: detach ", id="status-right")
+        with Horizontal():
+            yield Static(id="status-session")
+            yield Static(id="status-state")
+            yield Static(id="status-hint")
 
-    def update_session_name(self, name: str) -> None:
-        self.session_name = name
-        self.query_one("#status-left", Static).update(f" {name}")
+    def on_mount(self) -> None:
+        """Initialize display when widget is mounted."""
+        self._update_session_display()
+        self._update_state_display()
+        self._update_hint_display()
+
+    def watch_session_name(self, new_name: str) -> None:
+        """Automatically update UI when session name changes."""
+        self._update_session_display()
+
+    def watch_session_id(self, new_id: int) -> None:
+        """Automatically update UI when session ID changes."""
+        self._update_session_display()
+
+    def watch_connected(self, is_connected: bool) -> None:
+        """Update connection state indicator."""
+        self._update_state_display()
+
+    def _update_session_display(self) -> None:
+        """Update the session name and ID display."""
+        session_widget = self.query_one("#status-session", Static)
+        session_widget.update(f" [{self.session_id}] {self.session_name}")
+
+    def _update_state_display(self) -> None:
+        """Update the connection state display."""
+        state_widget = self.query_one("#status-state", Static)
+        if self.connected:
+            state_widget.update("")
+            state_widget.remove_class("disconnected")
+        else:
+            state_widget.update(" [disconnected]")
+            state_widget.add_class("disconnected")
+
+    def _update_hint_display(self) -> None:
+        """Update the keybinding hint display."""
+        hint_widget = self.query_one("#status-hint", Static)
+        hint_widget.update("Ctrl+B D: detach ")
 
 
 NEW_SESSION_TAB_ID = "__new_session__"
 
 
 class SessionTabs(Tabs):
-    """Tabs widget for switching between sessions."""
+    """Tabs widget with visual state indicators."""
+
+    # Track session states
+    session_activity: reactive[dict[int, bool]] = reactive(dict, init=False)
+    session_connected: reactive[dict[int, bool]] = reactive(dict, init=False)
 
     class NewSessionRequested(TextualMessage):
         """Posted when user clicks the + tab."""
@@ -61,8 +109,50 @@ class SessionTabs(Tabs):
         self._sessions = {sid: name for sid, name in sessions}
         self._active_session_id = active_session_id
 
+        # Initialize state tracking
+        self.session_activity = {sid: False for sid, _ in sessions}
+        self.session_connected = {sid: True for sid, _ in sessions}
+
     def on_mount(self) -> None:
         self.active = f"session-{self._active_session_id}"
+
+    def mark_activity(self, session_id: int) -> None:
+        """Mark a session as having new activity."""
+        if session_id != self._active_session_id:
+            self.session_activity[session_id] = True
+            try:
+                tab = self.query_one(f"#session-{session_id}", Tab)
+                tab.add_class("has-activity")
+            except Exception:
+                pass  # Tab might not exist yet
+
+    def clear_activity(self, session_id: int) -> None:
+        """Clear activity indicator when session becomes active."""
+        if session_id in self.session_activity:
+            self.session_activity[session_id] = False
+        try:
+            tab = self.query_one(f"#session-{session_id}", Tab)
+            tab.remove_class("has-activity")
+        except Exception:
+            pass  # Tab might not exist yet
+
+    def mark_disconnected(self, session_id: int) -> None:
+        """Mark a session as disconnected."""
+        self.session_connected[session_id] = False
+        try:
+            tab = self.query_one(f"#session-{session_id}", Tab)
+            tab.add_class("disconnected")
+        except Exception:
+            pass  # Tab might not exist yet
+
+    def mark_connected(self, session_id: int) -> None:
+        """Mark a session as connected."""
+        self.session_connected[session_id] = True
+        try:
+            tab = self.query_one(f"#session-{session_id}", Tab)
+            tab.remove_class("disconnected")
+        except Exception:
+            pass  # Tab might not exist yet
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         tab_id = event.tab.id
@@ -75,6 +165,8 @@ class SessionTabs(Tabs):
         else:
             session_id = int(tab_id.replace("session-", ""))
             if session_id != self._active_session_id:
+                # Clear activity indicator when switching to a tab
+                self.clear_activity(session_id)
                 self._active_session_id = session_id
                 self.post_message(self.SessionSwitchRequested(session_id))
 
@@ -85,6 +177,10 @@ class SessionTabs(Tabs):
         self.add_tab(new_tab, before=NEW_SESSION_TAB_ID)
         self._active_session_id = session_id
         self.active = f"session-{session_id}"
+
+        # Initialize state for new session
+        self.session_activity[session_id] = False
+        self.session_connected[session_id] = True
 
     def get_session_name(self, session_id: int) -> str:
         return self._sessions[session_id]
@@ -107,18 +203,47 @@ class TerminalApp(App[None]):
         width: 100%;
         height: 1fr;
     }
-    StatusBar {
+    EnhancedStatusBar {
         dock: bottom;
         height: 1;
-        layout: horizontal;
         background: $surface;
         color: $text-muted;
     }
-    StatusBar > #status-left {
+    EnhancedStatusBar Horizontal {
+        height: 100%;
+        width: 100%;
+    }
+    EnhancedStatusBar > Horizontal > #status-session {
         width: 1fr;
     }
-    StatusBar > #status-right {
+    EnhancedStatusBar > Horizontal > #status-state {
         width: auto;
+    }
+    EnhancedStatusBar > Horizontal > #status-hint {
+        width: auto;
+    }
+    EnhancedStatusBar .disconnected {
+        color: $error;
+        text-style: bold;
+    }
+
+    /* Tab state indicators */
+    Tab.has-activity {
+        background: $warning-darken-2;
+        text-style: italic;
+    }
+
+    Tab.has-activity:hover {
+        background: $warning-darken-1;
+    }
+
+    Tab.disconnected {
+        background: $error-darken-2;
+        color: $text-muted;
+    }
+
+    Tab.disconnected:hover {
+        background: $error-darken-1;
     }
     """
 
@@ -143,7 +268,7 @@ class TerminalApp(App[None]):
             session_id=self._active_session_id,
         )
         active_name = self._get_session_name(self._active_session_id)
-        yield StatusBar(active_name)
+        yield EnhancedStatusBar(active_name, self._active_session_id)
 
     def _get_session_name(self, session_id: int) -> str:
         for sid, name in self._sessions:
@@ -169,7 +294,9 @@ class TerminalApp(App[None]):
 
         session_name = self.query_one(SessionTabs).get_session_name(event.session_id)
         self.title = session_name
-        self.query_one(StatusBar).update_session_name(session_name)
+        status_bar = self.query_one(EnhancedStatusBar)
+        status_bar.session_name = session_name
+        status_bar.session_id = event.session_id
 
     def on_session_tabs_new_session_requested(
         self, event: SessionTabs.NewSessionRequested
@@ -181,7 +308,7 @@ class TerminalApp(App[None]):
         """Create a new session via RPC and return (session_id, name)."""
         reader, writer = await asyncio.open_unix_connection(self.socket_path)
 
-        identify_msg = encode_identify(80, 24)
+        identify_msg = encode_identify(DEFAULT_TERMINAL_WIDTH, DEFAULT_TERMINAL_HEIGHT)
         writer.write(identify_msg.encode())
         await writer.drain()
 
@@ -221,7 +348,9 @@ class TerminalApp(App[None]):
             terminal.focus()
 
             self.title = name
-            self.query_one(StatusBar).update_session_name(name)
+            status_bar = self.query_one(EnhancedStatusBar)
+            status_bar.session_name = name
+            status_bar.session_id = session_id
 
         asyncio.create_task(do_create())
 
@@ -266,4 +395,6 @@ class TerminalApp(App[None]):
         self.exit(message="[shell exited]")
 
     def on_terminal_pane_connection_failed(self, event: TerminalPane.ConnectionFailed) -> None:
+        status_bar = self.query_one(EnhancedStatusBar)
+        status_bar.connected = False
         self.exit(message=f"[connection failed: {event.error}]")
