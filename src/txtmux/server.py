@@ -16,6 +16,7 @@ from txtmux.protocol import (
     decode_input,
     decode_new_session,
     decode_resize,
+    decode_kill_session,
     encode_error,
     encode_output,
     encode_session_info,
@@ -408,6 +409,32 @@ class SessionServer:
                 session_id = session_id_opt
                 self._session_manager.detach_client(session_id, client_id)
                 del self._client_sessions[client_id]
+
+        elif message.msg_type == MessageType.KILL_SESSION:
+            session_id = decode_kill_session(message.payload)
+            session = self._session_manager.find_session(
+                session_id=session_id,
+                name=None,
+            )
+            if session is None:
+                error_msg = encode_error(f"Session {session_id} not found")
+                writer.write(error_msg.encode())
+                await writer.drain()
+                return
+
+            # Detach all clients from this session
+            client_ids = self._session_manager.get_attached_clients(session_id).copy()
+            for cid in client_ids:
+                self._session_manager.detach_client(session_id, cid)
+                self._client_sessions.pop(cid, None)
+
+            # Cancel PTY forwarding task if running
+            task = self._pty_tasks.pop(session_id, None)
+            if task:
+                task.cancel()
+
+            # Destroy the session
+            self._session_manager.destroy_session(session_id)
 
         else:
             error_msg = encode_error(

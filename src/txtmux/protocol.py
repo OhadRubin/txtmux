@@ -19,6 +19,7 @@ class MessageType(IntEnum):
     ERROR = 8
     SESSION_INFO = 9
     SHELL_EXITED = 10
+    KILL_SESSION = 11
 
 
 HEADER_FORMAT = "!II"
@@ -218,3 +219,15 @@ def decode_shell_exited(payload: bytes) -> tuple[int, int]:
     """Decode SHELL_EXITED payload to (session_id, pane_id)."""
     session_id, pane_id = struct.unpack("!II", payload)
     return (session_id, pane_id)
+
+
+def encode_kill_session(session_id: int) -> Message:
+    """Encode KILL_SESSION message with session ID."""
+    payload = struct.pack("!I", session_id)
+    return Message(MessageType.KILL_SESSION, payload)
+
+
+def decode_kill_session(payload: bytes) -> int:
+    """Decode KILL_SESSION payload to session ID."""
+    session_id: int = struct.unpack("!I", payload)[0]
+    return session_id
