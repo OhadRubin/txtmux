@@ -84,6 +84,10 @@ class TerminalScreen:
         """Convert pyte color string to Rich color."""
         if color == "default":
             return None
+        if len(color) == 6 and all(c in "0123456789abcdefABCDEF" for c in color):
+            return f"#{color}"
+        if color.startswith("bright"):
+            return f"bright_{color[6:]}"
         return color
 
 
@@ -323,3 +327,39 @@ class TerminalPane(Widget):
             self._writer.write(detach_msg.encode())
         except (ConnectionError, OSError):
             pass  # Read loop will detect disconnection
+
+    def reconnect(self, session_id: int) -> None:
+        """Disconnect from current session and connect to a new one."""
+        if self.socket_path is None:
+            raise RuntimeError("cannot reconnect: not in network mode")
+
+        self._close_connection()
+        self._reset_screen()
+        self.session_id = session_id
+
+        width, height = self.size.width, self.size.height
+        if width < 1:
+            width = 80
+        if height < 1:
+            height = 24
+        self._connect_to_server(width, height)
+
+    def _close_connection(self) -> None:
+        """Close the current socket connection."""
+        if self._writer is not None:
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+        self._writer = None
+        self._reader = None
+
+    def _reset_screen(self) -> None:
+        """Reset the terminal screen to blank state."""
+        width, height = self.size.width, self.size.height
+        if width < 1:
+            width = 80
+        if height < 1:
+            height = 24
+        self.terminal_screen = TerminalScreen(width, height)
+        self.refresh()

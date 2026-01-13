@@ -157,13 +157,17 @@ def cmd_new_session(args: argparse.Namespace) -> None:
     socket_path = get_socket_path()
     ensure_server_running(socket_path)
 
+    existing_sessions = asyncio.run(list_sessions(socket_path))
+    sessions_list = [(sid, name) for sid, name, *_ in existing_sessions]
+
     name = args.name if args.name else ""
     session_id, session_name = asyncio.run(create_session(socket_path, name))
+    sessions_list.append((session_id, session_name))
 
     app = TerminalApp(
         socket_path=socket_path,
-        session_id=session_id,
-        session_name=session_name,
+        sessions=sessions_list,
+        active_session_id=session_id,
     )
     app.run()
 
@@ -177,25 +181,23 @@ def cmd_attach(args: argparse.Namespace) -> None:
         print("No server running", file=sys.stderr)
         sys.exit(1)
 
+    sessions = asyncio.run(list_sessions(socket_path))
+    if not sessions:
+        print("No sessions", file=sys.stderr)
+        sys.exit(1)
+
+    sessions_list = [(sid, name) for sid, name, *_ in sessions]
+
     target = getattr(args, "target", None)
     if target is None:
-        sessions = asyncio.run(list_sessions(socket_path))
-        if not sessions:
-            print("No sessions", file=sys.stderr)
-            sys.exit(1)
-        if len(sessions) > 1:
-            print("Multiple sessions exist. Use -t to specify target:", file=sys.stderr)
-            for sid, name, *_ in sessions:
-                print(f"  {sid}: {name}", file=sys.stderr)
-            sys.exit(1)
-        session_id, session_name, *_ = sessions[0]
+        session_id, _session_name, *_ = sessions[0]
     else:
-        session_id, session_name = asyncio.run(find_session(socket_path, target))
+        session_id, _session_name = asyncio.run(find_session(socket_path, target))
 
     app = TerminalApp(
         socket_path=socket_path,
-        session_id=session_id,
-        session_name=session_name,
+        sessions=sessions_list,
+        active_session_id=session_id,
     )
     app.run()
 

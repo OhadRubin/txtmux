@@ -10,21 +10,33 @@ class TestTerminalApp:
     """Tests for TerminalApp structure and behavior."""
 
     def test_terminal_app_stores_session_info(self):
-        """TerminalApp stores socket_path, session_id, session_name."""
-        app = TerminalApp("/tmp/test.sock", 42, "my-session")
+        """TerminalApp stores socket_path, sessions, and active_session_id."""
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(42, "my-session")],
+            active_session_id=42,
+        )
         assert app.socket_path == "/tmp/test.sock"
-        assert app.session_id == 42
-        assert app.session_name == "my-session"
+        assert app._sessions == [(42, "my-session")]
+        assert app._active_session_id == 42
 
     def test_terminal_app_has_prefix_state(self):
         """TerminalApp has _prefix_active for Ctrl+B D handling."""
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         assert hasattr(app, "_prefix_active")
         assert app._prefix_active is False
 
     def test_terminal_app_has_required_methods(self):
         """TerminalApp has on_key and on_terminal_pane_detached handlers."""
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         assert hasattr(app, "on_key")
         assert hasattr(app, "on_terminal_pane_detached")
         assert hasattr(app, "_do_detach")
@@ -54,7 +66,11 @@ class TestPrefixKeyHandling:
         """Pressing ctrl+b (via action_prefix_key) sets _prefix_active to True."""
         from unittest.mock import MagicMock, patch
 
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         assert app._prefix_active is False
 
         mock_pane = MagicMock()
@@ -69,7 +85,11 @@ class TestPrefixKeyHandling:
         from textual import events
         from unittest.mock import MagicMock, patch
 
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         app._prefix_active = True
 
         mock_pane = MagicMock()
@@ -86,7 +106,11 @@ class TestPrefixKeyHandling:
         from textual import events
         from unittest.mock import MagicMock, patch
 
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         app._prefix_active = True
 
         mock_pane = MagicMock()
@@ -103,7 +127,11 @@ class TestPrefixKeyHandling:
         from textual import events
         from unittest.mock import MagicMock, patch
 
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         app._prefix_active = True
         app._do_detach = MagicMock()
 
@@ -119,7 +147,11 @@ class TestPrefixKeyHandling:
         from textual import events
         from unittest.mock import MagicMock, patch
 
-        app = TerminalApp("/tmp/test.sock", 0, "test")
+        app = TerminalApp(
+            socket_path="/tmp/test.sock",
+            sessions=[(0, "test")],
+            active_session_id=0,
+        )
         app._prefix_active = True
         app._forward_prefix_and_key = MagicMock()
 
