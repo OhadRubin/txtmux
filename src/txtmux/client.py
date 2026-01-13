@@ -7,7 +7,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Header, Static, Tabs, Tab
 from textual.message import Message as TextualMessage
-from textual import events
+from textual import events, work
 
 from txtmux.terminal_widget import TerminalPane
 from txtmux.protocol import (
@@ -162,14 +162,25 @@ class TerminalApp(App[None]):
         self, event: SessionTabs.SessionSwitchRequested
     ) -> None:
         """Handle tab switch: reconnect to the new session."""
-        self._active_session_id = event.session_id
         terminal = self.query_one(TerminalPane)
-        terminal.reconnect(event.session_id)
-        terminal.focus()
+        terminal.loading = True
 
-        session_name = self.query_one(SessionTabs).get_session_name(event.session_id)
-        self.title = session_name
-        self.query_one(StatusBar).update_session_name(session_name)
+        try:
+            self._active_session_id = event.session_id
+            terminal.reconnect(event.session_id)
+            terminal.focus()
+
+            session_name = self.query_one(SessionTabs).get_session_name(event.session_id)
+            self.title = session_name
+            self.query_one(StatusBar).update_session_name(session_name)
+
+            self.notify(
+                f"Switched to session '{session_name}'",
+                severity="information",
+                timeout=2,
+            )
+        finally:
+            terminal.loading = False
 
     def on_session_tabs_new_session_requested(
         self, event: SessionTabs.NewSessionRequested
@@ -206,9 +217,14 @@ class TerminalApp(App[None]):
             if message.msg_type == MessageType.ERROR:
                 raise RuntimeError(f"server error: {message.payload.decode()}")
 
-    def _create_new_session(self) -> None:
-        """Create new session and switch to it."""
-        async def do_create() -> None:
+    @work(exclusive=True, exit_on_error=False)
+    async def _create_new_session_worker(self) -> None:
+        """Create new session with proper error handling."""
+        terminal = self.query_one(TerminalPane)
+        terminal.loading = True
+
+        try:
+            self.notify("Creating new session...", severity="information", timeout=2)
             session_id, name = await self._create_new_session_rpc()
             self._sessions.append((session_id, name))
             self._active_session_id = session_id
@@ -216,14 +232,45 @@ class TerminalApp(App[None]):
             tabs = self.query_one(SessionTabs)
             tabs.add_session_tab(session_id, name)
 
-            terminal = self.query_one(TerminalPane)
             terminal.reconnect(session_id)
             terminal.focus()
 
             self.title = name
             self.query_one(StatusBar).update_session_name(name)
 
-        asyncio.create_task(do_create())
+            self.notify(
+                f"Session '{name}' created successfully",
+                severity="information",
+                timeout=2,
+            )
+        except ConnectionRefusedError:
+            self.notify(
+                "Cannot create session: server not responding",
+                title="Connection Error",
+                severity="error",
+                timeout=10,
+            )
+        except RuntimeError as e:
+            self.notify(
+                f"Server error: {e}",
+                title="Session Creation Failed",
+                severity="error",
+                timeout=10,
+            )
+        except Exception as e:
+            self.notify(
+                f"Unexpected error: {type(e).__name__}: {e}",
+                title="Error",
+                severity="error",
+                timeout=10,
+            )
+            self.log.error(f"Unexpected error in session creation: {e}", exc_info=True)
+        finally:
+            terminal.loading = False
+
+    def _create_new_session(self) -> None:
+        """Entry point for creating new session."""
+        self._create_new_session_worker()
 
     def action_prefix_key(self) -> None:
         """Handle Ctrl+B/Escape prefix key (via BINDINGS)."""
@@ -259,11 +306,24 @@ class TerminalApp(App[None]):
         """Handle SIGTERM/SIGINT with clean exit."""
         self.exit(message="[interrupted]")
 
+    async def _delayed_exit(self, message: str, delay: float) -> None:
+        """Exit after a delay to allow user to read notification."""
+        await asyncio.sleep(delay)
+        self.exit(message=message)
+
     def on_terminal_pane_detached(self, event: TerminalPane.Detached) -> None:
-        self.exit(message="[detached]")
+        self.notify("Detached from session", severity="information", timeout=2)
+        asyncio.create_task(self._delayed_exit("[detached]", delay=0.5))
 
     def on_terminal_pane_shell_exited(self, event: TerminalPane.ShellExited) -> None:
-        self.exit(message="[shell exited]")
+        self.notify("Shell process has exited", title="Session Ended", severity="warning", timeout=3)
+        asyncio.create_task(self._delayed_exit("[shell exited]", delay=1.0))
 
     def on_terminal_pane_connection_failed(self, event: TerminalPane.ConnectionFailed) -> None:
-        self.exit(message=f"[connection failed: {event.error}]")
+        self.notify(
+            f"Connection failed: {event.error}",
+            title="Connection Error",
+            severity="error",
+            timeout=5,
+        )
+        asyncio.create_task(self._delayed_exit(f"[connection failed: {event.error}]", delay=2.0))

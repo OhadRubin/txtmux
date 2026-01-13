@@ -164,17 +164,43 @@ class TerminalPane(Widget):
             set_pty_size(self.master_fd, width, height)
             self._start_pty_reader()
 
-    @work(exclusive=True)
+    @work(exclusive=True, exit_on_error=False)
     async def _connect_to_server(self, width: int, height: int) -> None:
-        """Connect to server socket and send IDENTIFY + ATTACH."""
+        """Connect to server socket with user feedback."""
         if self.socket_path is None:
             raise RuntimeError("socket_path is None in network mode")
         if self.session_id is None:
             raise RuntimeError("session_id is None in network mode")
 
+        self.app.notify("Connecting to session...", severity="information", timeout=2)
+
         try:
             reader, writer = await asyncio.open_unix_connection(self.socket_path)
-        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+        except ConnectionRefusedError:
+            self.app.notify(
+                "Server is not running. Start it with 'txtmux' first.",
+                title="Connection Failed",
+                severity="error",
+                timeout=10,
+            )
+            self.post_message(self.ConnectionFailed("Connection refused"))
+            return
+        except FileNotFoundError:
+            self.app.notify(
+                f"Socket not found: {self.socket_path}",
+                title="Connection Failed",
+                severity="error",
+                timeout=10,
+            )
+            self.post_message(self.ConnectionFailed("Socket not found"))
+            return
+        except OSError as e:
+            self.app.notify(
+                f"Connection error: {e}",
+                title="Connection Failed",
+                severity="error",
+                timeout=10,
+            )
             self.post_message(self.ConnectionFailed(str(e)))
             return
 
@@ -189,7 +215,15 @@ class TerminalPane(Widget):
             attach_msg = encode_attach(self.session_id)
             writer.write(attach_msg.encode())
             await writer.drain()
+
+            self.app.notify("Connected successfully", severity="information", timeout=2)
         except (ConnectionError, OSError) as e:
+            self.app.notify(
+                f"Failed to send handshake: {e}",
+                title="Connection Failed",
+                severity="error",
+                timeout=10,
+            )
             self.post_message(self.ConnectionFailed(str(e)))
             return
 
