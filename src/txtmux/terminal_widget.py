@@ -7,6 +7,7 @@ from rich.style import Style
 from textual.widget import Widget
 from textual.message import Message as TextualMessage
 from textual import events, work
+from textual.reactive import reactive
 
 from txtmux.pty_handler import spawn_shell, read_pty, write_pty, set_pty_size
 from txtmux.protocol import (
@@ -22,8 +23,8 @@ from txtmux.protocol import (
 )
 
 
-class PyteScreenCompat(pyte.Screen):  # type: ignore[misc]
-    """pyte Screen subclass that handles private SGR sequences."""
+class PyteHistoryScreenCompat(pyte.HistoryScreen):  # type: ignore[misc]
+    """pyte HistoryScreen subclass that handles private SGR sequences."""
 
     def select_graphic_rendition(self, *attrs: int, private: bool = False) -> None:
         """Handle SGR with optional private flag (ignored for compatibility)."""
@@ -31,11 +32,15 @@ class PyteScreenCompat(pyte.Screen):  # type: ignore[misc]
 
 
 class TerminalScreen:
-    """Wrapper around pyte for terminal emulation."""
+    """Wrapper around pyte for terminal emulation with scrollback history."""
 
-    def __init__(self, width: int, height: int):
-        self.screen = PyteScreenCompat(width, height)
+    def __init__(self, width: int, height: int, history_lines: int = 10000):
+        # Use HistoryScreen instead of Screen for scrollback support
+        self.screen = PyteHistoryScreenCompat(
+            columns=width, lines=height, history=history_lines, ratio=0.5
+        )
         self.stream = pyte.Stream(self.screen)
+        self.history_lines = history_lines
 
     def feed(self, data: bytes) -> None:
         """Feed raw bytes from PTY into the terminal emulator."""
@@ -49,6 +54,53 @@ class TerminalScreen:
     def cursor(self) -> tuple[int, int]:
         """Return current cursor position as (x, y)."""
         return (self.screen.cursor.x, self.screen.cursor.y)
+
+    def prev_page(self) -> None:
+        """Scroll up one page in history."""
+        self.screen.prev_page()
+
+    def next_page(self) -> None:
+        """Scroll down one page in history."""
+        self.screen.next_page()
+
+    def get_history(self, max_lines: int = 1000) -> list[Text]:
+        """Extract history lines for copy mode with styling."""
+        history = []
+        if hasattr(self.screen, "history") and hasattr(self.screen.history, "top"):
+            # Convert to list and take last max_lines
+            history_top = list(self.screen.history.top)[-max_lines:]
+            for line_dict in history_top:
+                if hasattr(line_dict, "values"):
+                    history.append(self._render_line(line_dict))
+        return history
+
+    def _render_line(self, line_dict: dict) -> Text:
+        """Render a single line with optimized style batching."""
+        line = Text()
+        current_text = ""
+        current_style = None
+
+        for char in line_dict.values():
+            char_style = self._char_style_key(char)
+            if char_style == current_style:
+                current_text += char.data or " "
+            else:
+                if current_text:
+                    line.append(current_text, style=current_style)
+                current_text = char.data or " "
+                current_style = char_style
+
+        if current_text:
+            line.append(current_text, style=current_style)
+        return line
+
+    def _char_style_key(self, char: pyte.screens.Char) -> Style | None:
+        """Get style for char, returning None for default styling."""
+        if (char.fg == "default" and char.bg == "default" and
+            not char.bold and not char.italics and not char.underscore and
+            not char.reverse and not char.strikethrough):
+            return None
+        return self._char_to_style(char, is_cursor=False)
 
     def render(self, show_cursor: bool) -> Text:
         """Convert pyte screen buffer to Rich Text with styling."""
@@ -112,6 +164,9 @@ class TerminalPane(Widget):
     """Textual widget combining TerminalScreen and PTY into an interactive terminal."""
 
     can_focus = True
+
+    # Reactive attribute that automatically triggers refresh when incremented
+    terminal_buffer_version = reactive(0)
 
     class Detached(TextualMessage):
         """Posted when client detaches from session."""
@@ -207,7 +262,8 @@ class TerminalPane(Widget):
             if self.terminal_screen is None:
                 raise RuntimeError("terminal_screen is None during PTY read loop")
             self.terminal_screen.feed(data)
-            self.refresh()
+            # Increment version to trigger automatic refresh via reactive system
+            self.terminal_buffer_version += 1
 
     async def _socket_read_loop(self) -> None:
         """Read messages from server socket and handle OUTPUT/DETACH."""
@@ -244,7 +300,8 @@ class TerminalPane(Widget):
                     return
 
             if had_output:
-                self.refresh()
+                # Increment version to trigger automatic refresh via reactive system
+                self.terminal_buffer_version += 1
 
         self.post_message(self.Detached())
 
@@ -362,4 +419,5 @@ class TerminalPane(Widget):
         if height < 1:
             height = 24
         self.terminal_screen = TerminalScreen(width, height)
-        self.refresh()
+        # Increment version to trigger automatic refresh via reactive system
+        self.terminal_buffer_version += 1

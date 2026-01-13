@@ -5,9 +5,15 @@ import signal
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.widget import Widget
 from textual.widgets import Header, Static, Tabs, Tab
 from textual.message import Message as TextualMessage
 from textual import events
+from textual.command import Provider, Hit
+from textual.screen import ModalScreen
+from textual.containers import Container, ScrollableContainer
+from textual.strip import Strip
+from rich.text import Text
 
 from txtmux.terminal_widget import TerminalPane
 from txtmux.protocol import (
@@ -37,6 +43,226 @@ class StatusBar(Static):
 
 
 NEW_SESSION_TAB_ID = "__new_session__"
+
+
+class VirtualScrollback(Widget):
+    """Virtualized scrollback widget - only renders visible lines."""
+
+    can_focus = True
+
+    def __init__(self, terminal_pane: "TerminalPane") -> None:
+        super().__init__()
+        self.terminal_pane = terminal_pane
+        self._lines: list[Text] = []
+        self._build_lines()
+
+    def _build_lines(self) -> None:
+        """Build the list of lines (raw data, not rendered yet)."""
+        if self.terminal_pane.terminal_screen is None:
+            self._lines = [Text("No terminal screen available")]
+            return
+
+        # Get history lines (already rendered as Text)
+        history = self.terminal_pane.terminal_screen.get_history()
+
+        # Get current screen lines
+        current = self.terminal_pane.terminal_screen.render(show_cursor=False)
+        current_lines = list(current.split("\n"))
+
+        self._lines = history + current_lines
+
+    def get_content_height(self, container: Widget, viewport: Widget, width: int) -> int:
+        """Return virtual height (total lines)."""
+        return len(self._lines)
+
+    def render_line(self, y: int) -> Strip:
+        """Render a single line - called only for visible lines."""
+        if y < 0 or y >= len(self._lines):
+            return Strip.blank(self.size.width)
+
+        line = self._lines[y]
+        segments = list(line.render(self.app.console))
+        return Strip(segments)
+
+    def get_all_text(self) -> str:
+        """Get all text for clipboard."""
+        return "\n".join(str(line) for line in self._lines)
+
+
+class CopyModeScreen(ModalScreen[None]):
+    """Modal screen for viewing terminal scrollback buffer."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Exit Copy Mode"),
+        Binding("q", "dismiss", "Quit"),
+        Binding("g", "scroll_top", "Go to Top"),
+        Binding("G", "scroll_bottom", "Go to Bottom"),
+        Binding("k", "scroll_up", "Up"),
+        Binding("j", "scroll_down", "Down"),
+        Binding("ctrl+u", "page_up", "Page Up"),
+        Binding("ctrl+d", "page_down", "Page Down"),
+        Binding("y", "copy_all", "Copy All"),
+    ]
+
+    CSS = """
+    CopyModeScreen {
+        align: center middle;
+    }
+
+    #copy-mode-container {
+        width: 100%;
+        height: 100%;
+        background: $surface;
+        border: thick $primary;
+    }
+
+    #scrollback-content {
+        width: 100%;
+        height: 1fr;
+        scrollbar-gutter: stable;
+    }
+
+    #status-line {
+        dock: bottom;
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, terminal_pane: "TerminalPane") -> None:
+        super().__init__()
+        self.terminal_pane = terminal_pane
+
+    def compose(self) -> ComposeResult:
+        """Compose the copy mode interface."""
+        with Container(id="copy-mode-container"):
+            with ScrollableContainer(id="scrollback-content"):
+                yield VirtualScrollback(self.terminal_pane)
+
+            yield Static(self._status_text(), id="status-line")
+
+    def _status_text(self) -> str:
+        """Generate status line text."""
+        return " COPY MODE | q: quit | y: copy all | g/G: top/bottom | j/k: scroll "
+
+    def on_mount(self) -> None:
+        """Scroll to bottom when copy mode opens."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_end(animate=False)
+
+    def action_dismiss(self) -> None:
+        """Exit copy mode."""
+        self.dismiss()
+
+    def action_scroll_top(self) -> None:
+        """Scroll to top of history."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_home()
+
+    def action_scroll_bottom(self) -> None:
+        """Scroll to bottom of history."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_end()
+
+    def action_scroll_up(self) -> None:
+        """Scroll up one line."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_up()
+
+    def action_scroll_down(self) -> None:
+        """Scroll down one line."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_down()
+
+    def action_page_up(self) -> None:
+        """Scroll up one page."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_page_up()
+
+    def action_page_down(self) -> None:
+        """Scroll down one page."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_page_down()
+
+    def action_copy_all(self) -> None:
+        """Copy all visible text to clipboard."""
+        scrollback = self.query_one(VirtualScrollback)
+        try:
+            self.app.copy_to_clipboard(scrollback.get_all_text())
+            self.notify("Copied to clipboard")
+        except Exception:
+            self.notify("Clipboard not supported", severity="warning")
+
+
+class SessionCommandProvider(Provider):
+    """Custom command provider for session-specific commands."""
+
+    async def startup(self) -> None:
+        """Called when command palette opens."""
+        # Access the app to get session list
+        pass
+
+    async def search(self, query: str) -> Hit:
+        """Yield commands matching the search query."""
+        matcher = self.matcher(query)
+        app = self.app
+
+        if not isinstance(app, TerminalApp):
+            return
+
+        # Get current sessions from the app
+        for session_id, session_name in app._sessions:
+            if session_id == app._active_session_id:
+                continue  # Skip current session
+
+            score = matcher.match(f"Switch to {session_name}")
+            if score > 0:
+                yield Hit(
+                    score=score,
+                    match_display=f"Switch to {session_name}",
+                    command_name=f"switch_to_{session_id}",
+                    help=f"Switch to session {session_id}",
+                    callback=lambda sid=session_id: self._switch_session(sid),
+                )
+
+    async def discover(self) -> Hit:
+        """Show sessions when palette opens with empty input."""
+        app = self.app
+
+        if not isinstance(app, TerminalApp):
+            return
+
+        for session_id, session_name in app._sessions:
+            if session_id == app._active_session_id:
+                continue  # Skip current session
+
+            yield Hit(
+                score=1.0,
+                match_display=f"Switch to {session_name}",
+                command_name=f"switch_to_{session_id}",
+                help=f"Session ID: {session_id}",
+                callback=lambda sid=session_id: self._switch_session(sid),
+            )
+
+    def _switch_session(self, session_id: int) -> None:
+        """Switch to specified session."""
+        app = self.app
+        if not isinstance(app, TerminalApp):
+            return
+
+        app._active_session_id = session_id
+        terminal = app.query_one(TerminalPane)
+        terminal.reconnect(session_id)
+        terminal.focus()
+
+        tabs = app.query_one(SessionTabs)
+        session_name = tabs.get_session_name(session_id)
+        app.title = session_name
+        app.query_one(StatusBar).update_session_name(session_name)
+        tabs._active_session_id = session_id
+        tabs.active = f"session-{session_id}"
 
 
 class SessionTabs(Tabs):
@@ -92,6 +318,12 @@ class SessionTabs(Tabs):
 
 class TerminalApp(App[None]):
     """Textual application hosting TerminalPane in network mode."""
+
+    # Enable command palette (Ctrl+P by default)
+    ENABLE_COMMAND_PALETTE = True
+
+    # Register custom command provider
+    COMMANDS = App.COMMANDS | {SessionCommandProvider}
 
     BINDINGS = [
         Binding("ctrl+b", "prefix_key", "Prefix", priority=True),
@@ -239,6 +471,10 @@ class TerminalApp(App[None]):
                 self._do_detach()
                 event.stop()
                 return
+            elif event.key == "pageup" or event.key == "left_square_bracket":
+                self._enter_copy_mode()
+                event.stop()
+                return
             self._forward_prefix_and_key(event)
             event.stop()
             return
@@ -254,6 +490,11 @@ class TerminalApp(App[None]):
         terminal = self.query_one(TerminalPane)
         terminal.detach()
         self.exit(message="[detached]")
+
+    def _enter_copy_mode(self) -> None:
+        """Launch copy mode screen for scrollback viewing."""
+        terminal = self.query_one(TerminalPane)
+        self.push_screen(CopyModeScreen(terminal))
 
     def _signal_handler(self) -> None:
         """Handle SIGTERM/SIGINT with clean exit."""
