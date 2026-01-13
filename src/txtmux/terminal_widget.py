@@ -20,6 +20,7 @@ from txtmux.protocol import (
     decode_shell_exited,
     MessageType,
 )
+from txtmux.constants import DEFAULT_TERMINAL_WIDTH, DEFAULT_TERMINAL_HEIGHT
 
 
 class PyteScreenCompat(pyte.Screen):  # type: ignore[misc]
@@ -150,9 +151,9 @@ class TerminalPane(Widget):
     def on_mount(self) -> None:
         width, height = self.size.width, self.size.height
         if width < 1:
-            width = 80
+            width = DEFAULT_TERMINAL_WIDTH
         if height < 1:
-            height = 24
+            height = DEFAULT_TERMINAL_HEIGHT
         self.terminal_screen = TerminalScreen(width, height)
 
         if self.socket_path is not None:
@@ -339,9 +340,9 @@ class TerminalPane(Widget):
 
         width, height = self.size.width, self.size.height
         if width < 1:
-            width = 80
+            width = DEFAULT_TERMINAL_WIDTH
         if height < 1:
-            height = 24
+            height = DEFAULT_TERMINAL_HEIGHT
         self._connect_to_server(width, height)
 
     def _close_connection(self) -> None:
@@ -358,8 +359,8 @@ class TerminalPane(Widget):
         """Reset the terminal screen to blank state."""
         width, height = self.size.width, self.size.height
         if width < 1:
-            width = 80
+            width = DEFAULT_TERMINAL_WIDTH
         if height < 1:
-            height = 24
+            height = DEFAULT_TERMINAL_HEIGHT
         self.terminal_screen = TerminalScreen(width, height)
         self.refresh()
