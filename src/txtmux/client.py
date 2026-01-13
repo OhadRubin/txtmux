@@ -5,7 +5,9 @@ import signal
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Static, Tabs, Tab
+from textual.containers import Grid
+from textual.screen import ModalScreen
+from textual.widgets import Header, Static, Tabs, Tab, Label, Button
 from textual.message import Message as TextualMessage
 from textual import events
 
@@ -14,6 +16,7 @@ from txtmux.protocol import (
     encode_identify,
     encode_new_session,
     encode_list_sessions,
+    encode_kill_session,
     decode,
     decode_session_info,
     MessageType,
@@ -37,6 +40,117 @@ class StatusBar(Static):
 
 
 NEW_SESSION_TAB_ID = "__new_session__"
+
+
+class DetachConfirmScreen(ModalScreen[bool]):
+    """Modal confirmation dialog for detaching from session."""
+
+    CSS = """
+    DetachConfirmScreen {
+        align: center middle;
+    }
+
+    #dialog {
+        grid-size: 2;
+        grid-gutter: 1 2;
+        grid-rows: 1fr 3;
+        padding: 0 1;
+        width: 60;
+        height: 11;
+        border: thick $background 80%;
+        background: $surface;
+    }
+
+    #question {
+        column-span: 2;
+        height: 1fr;
+        width: 1fr;
+        content-align: center middle;
+    }
+
+    Button {
+        width: 100%;
+    }
+    """
+
+    def __init__(self, session_name: str) -> None:
+        super().__init__()
+        self.session_name = session_name
+
+    def compose(self) -> ComposeResult:
+        yield Grid(
+            Label(f"Detach from session '{self.session_name}'?", id="question"),
+            Button("Detach", variant="error", id="detach"),
+            Button("Cancel", variant="primary", id="cancel"),
+            id="dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "detach":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+
+class KillSessionConfirmScreen(ModalScreen[bool]):
+    """Modal confirmation dialog for killing a session."""
+
+    CSS = """
+    KillSessionConfirmScreen {
+        align: center middle;
+    }
+
+    #dialog {
+        grid-size: 2;
+        grid-gutter: 1 2;
+        grid-rows: 1fr 1fr 3;
+        padding: 0 1;
+        width: 70;
+        height: 13;
+        border: thick $background 80%;
+        background: $surface;
+    }
+
+    #question {
+        column-span: 2;
+        height: 1fr;
+        width: 1fr;
+        content-align: center middle;
+        color: $error;
+    }
+
+    #warning {
+        column-span: 2;
+        height: 1fr;
+        width: 1fr;
+        content-align: center middle;
+        color: $text-muted;
+    }
+
+    Button {
+        width: 100%;
+    }
+    """
+
+    def __init__(self, session_name: str, session_id: int) -> None:
+        super().__init__()
+        self.session_name = session_name
+        self.session_id = session_id
+
+    def compose(self) -> ComposeResult:
+        yield Grid(
+            Label(f"Kill session '{self.session_name}'?", id="question"),
+            Label("This will terminate all processes and cannot be undone.", id="warning"),
+            Button("Kill Session", variant="error", id="kill"),
+            Button("Cancel", variant="primary", id="cancel"),
+            id="dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "kill":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
 
 
 class SessionTabs(Tabs):
@@ -89,6 +203,13 @@ class SessionTabs(Tabs):
     def get_session_name(self, session_id: int) -> str:
         return self._sessions[session_id]
 
+    def remove_session_tab(self, session_id: int) -> None:
+        """Remove a session tab."""
+        tab_id = f"session-{session_id}"
+        tab = self.query_one(f"#{tab_id}", Tab)
+        tab.remove()
+        del self._sessions[session_id]
+
 
 class TerminalApp(App[None]):
     """Textual application hosting TerminalPane in network mode."""
@@ -96,6 +217,8 @@ class TerminalApp(App[None]):
     BINDINGS = [
         Binding("ctrl+b", "prefix_key", "Prefix", priority=True),
         Binding("escape", "prefix_key", "Prefix (esc)", priority=True),
+        Binding("ctrl+k", "kill_session", "Kill Session", priority=True),
+        Binding("ctrl+w", "close_tab", "Close Tab", priority=True),
     ]
 
     CSS = """
@@ -236,7 +359,7 @@ class TerminalApp(App[None]):
             terminal = self.query_one(TerminalPane)
             terminal.prefix_active = False
             if event.key == "d":
-                self._do_detach()
+                self._request_detach()
                 event.stop()
                 return
             self._forward_prefix_and_key(event)
@@ -250,10 +373,85 @@ class TerminalApp(App[None]):
         terminal.send_key(event)
         event.stop()
 
+    def _request_detach(self) -> None:
+        """Request detach with confirmation dialog."""
+        session_name = self.query_one(SessionTabs).get_session_name(self._active_session_id)
+
+        def check_detach(detach: bool | None) -> None:
+            """Called when DetachConfirmScreen is dismissed."""
+            if detach:
+                self._do_detach()
+
+        self.push_screen(DetachConfirmScreen(session_name), check_detach)
+
     def _do_detach(self) -> None:
         terminal = self.query_one(TerminalPane)
         terminal.detach()
         self.exit(message="[detached]")
+
+    def action_kill_session(self) -> None:
+        """Action to kill the current session with confirmation."""
+        session_name = self.query_one(SessionTabs).get_session_name(self._active_session_id)
+
+        def check_kill(kill: bool | None) -> None:
+            """Called when KillSessionConfirmScreen is dismissed."""
+            if kill:
+                self._kill_current_session()
+
+        self.push_screen(KillSessionConfirmScreen(session_name, self._active_session_id), check_kill)
+
+    def action_close_tab(self) -> None:
+        """Close current session tab with confirmation."""
+        self.action_kill_session()
+
+    async def _kill_session_rpc(self, session_id: int) -> None:
+        """Kill a session via RPC."""
+        reader, writer = await asyncio.open_unix_connection(self.socket_path)
+
+        identify_msg = encode_identify(80, 24)
+        writer.write(identify_msg.encode())
+        await writer.drain()
+
+        kill_msg = encode_kill_session(session_id)
+        writer.write(kill_msg.encode())
+        await writer.drain()
+
+        writer.close()
+        await writer.wait_closed()
+
+    def _kill_current_session(self) -> None:
+        """Kill the current session and switch to another or exit."""
+        async def do_kill() -> None:
+            session_id_to_kill = self._active_session_id
+
+            # Send kill message to server
+            await self._kill_session_rpc(session_id_to_kill)
+
+            # Remove from local session list
+            self._sessions = [s for s in self._sessions if s[0] != session_id_to_kill]
+
+            # Remove tab
+            tabs = self.query_one(SessionTabs)
+            tabs.remove_session_tab(session_id_to_kill)
+
+            # If there are other sessions, switch to one
+            if self._sessions:
+                new_session_id = self._sessions[0][0]
+                self._active_session_id = new_session_id
+                tabs.active = f"session-{new_session_id}"
+
+                terminal = self.query_one(TerminalPane)
+                terminal.reconnect(new_session_id)
+                terminal.focus()
+
+                session_name = tabs.get_session_name(new_session_id)
+                self.title = session_name
+                self.query_one(StatusBar).update_session_name(session_name)
+            else:
+                # No more sessions, exit
+                self.exit(message="[all sessions closed]")
+
+        asyncio.create_task(do_kill())
 
     def _signal_handler(self) -> None:
         """Handle SIGTERM/SIGINT with clean exit."""
