@@ -5,13 +5,14 @@ import signal
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.widget import Widget
 from textual.widgets import Header, Static, Tabs, Tab
 from textual.message import Message as TextualMessage
 from textual import events
 from textual.command import Provider, Hit
-from textual.types import IgnoreReturnCallbackType
 from textual.screen import ModalScreen
 from textual.containers import Container, ScrollableContainer
+from textual.strip import Strip
 from rich.text import Text
 
 from txtmux.terminal_widget import TerminalPane
@@ -42,6 +43,50 @@ class StatusBar(Static):
 
 
 NEW_SESSION_TAB_ID = "__new_session__"
+
+
+class VirtualScrollback(Widget):
+    """Virtualized scrollback widget - only renders visible lines."""
+
+    can_focus = True
+
+    def __init__(self, terminal_pane: "TerminalPane") -> None:
+        super().__init__()
+        self.terminal_pane = terminal_pane
+        self._lines: list[Text] = []
+        self._build_lines()
+
+    def _build_lines(self) -> None:
+        """Build the list of lines (raw data, not rendered yet)."""
+        if self.terminal_pane.terminal_screen is None:
+            self._lines = [Text("No terminal screen available")]
+            return
+
+        # Get history lines (already rendered as Text)
+        history = self.terminal_pane.terminal_screen.get_history()
+
+        # Get current screen lines
+        current = self.terminal_pane.terminal_screen.render(show_cursor=False)
+        current_lines = list(current.split("\n"))
+
+        self._lines = history + current_lines
+
+    def get_content_height(self, container: Widget, viewport: Widget, width: int) -> int:
+        """Return virtual height (total lines)."""
+        return len(self._lines)
+
+    def render_line(self, y: int) -> Strip:
+        """Render a single line - called only for visible lines."""
+        if y < 0 or y >= len(self._lines):
+            return Strip.blank(self.size.width)
+
+        line = self._lines[y]
+        segments = list(line.render(self.app.console))
+        return Strip(segments)
+
+    def get_all_text(self) -> str:
+        """Get all text for clipboard."""
+        return "\n".join(str(line) for line in self._lines)
 
 
 class CopyModeScreen(ModalScreen[None]):
@@ -86,40 +131,26 @@ class CopyModeScreen(ModalScreen[None]):
     }
     """
 
-    def __init__(self, terminal_screen: "TerminalPane") -> None:
+    def __init__(self, terminal_pane: "TerminalPane") -> None:
         super().__init__()
-        self.terminal_screen = terminal_screen
+        self.terminal_pane = terminal_pane
 
     def compose(self) -> ComposeResult:
         """Compose the copy mode interface."""
         with Container(id="copy-mode-container"):
-            # Scrollable container for terminal history
             with ScrollableContainer(id="scrollback-content"):
-                yield Static(self._render_scrollback(), id="history-display")
+                yield VirtualScrollback(self.terminal_pane)
 
-            # Status bar showing current mode and position
             yield Static(self._status_text(), id="status-line")
-
-    def _render_scrollback(self) -> Text:
-        """Render terminal history and current screen."""
-        if self.terminal_screen.terminal_screen is None:
-            return Text("No terminal screen available")
-
-        history_lines = self.terminal_screen.terminal_screen.get_history()
-        current_screen = self.terminal_screen.terminal_screen.render(show_cursor=False)
-
-        # Combine history + current screen
-        full_content = Text()
-        for line in history_lines:
-            full_content.append(line)
-            full_content.append("\n")
-        full_content.append(current_screen)
-
-        return full_content
 
     def _status_text(self) -> str:
         """Generate status line text."""
         return " COPY MODE | q: quit | y: copy all | g/G: top/bottom | j/k: scroll "
+
+    def on_mount(self) -> None:
+        """Scroll to bottom when copy mode opens."""
+        container = self.query_one("#scrollback-content", ScrollableContainer)
+        container.scroll_end(animate=False)
 
     def action_dismiss(self) -> None:
         """Exit copy mode."""
@@ -157,9 +188,9 @@ class CopyModeScreen(ModalScreen[None]):
 
     def action_copy_all(self) -> None:
         """Copy all visible text to clipboard."""
-        content = self.query_one("#history-display", Static)
+        scrollback = self.query_one(VirtualScrollback)
         try:
-            self.app.copy_to_clipboard(str(content.renderable))
+            self.app.copy_to_clipboard(scrollback.get_all_text())
             self.notify("Copied to clipboard")
         except Exception:
             self.notify("Clipboard not supported", severity="warning")
@@ -440,7 +471,7 @@ class TerminalApp(App[None]):
                 self._do_detach()
                 event.stop()
                 return
-            elif event.key == "pageup" or event.key == "[":
+            elif event.key == "pageup" or event.key == "left_square_bracket":
                 self._enter_copy_mode()
                 event.stop()
                 return

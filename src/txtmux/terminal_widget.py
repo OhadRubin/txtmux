@@ -63,15 +63,44 @@ class TerminalScreen:
         """Scroll down one page in history."""
         self.screen.next_page()
 
-    def get_history(self) -> list[str]:
-        """Extract all history lines for copy mode."""
+    def get_history(self, max_lines: int = 1000) -> list[Text]:
+        """Extract history lines for copy mode with styling."""
         history = []
-        if hasattr(self.screen, "history"):
-            # HistoryScreen maintains history as a deque
-            for line_dict in self.screen.history:
-                line_str = "".join(char.data or " " for char in line_dict.values())
-                history.append(line_str)
+        if hasattr(self.screen, "history") and hasattr(self.screen.history, "top"):
+            # Convert to list and take last max_lines
+            history_top = list(self.screen.history.top)[-max_lines:]
+            for line_dict in history_top:
+                if hasattr(line_dict, "values"):
+                    history.append(self._render_line(line_dict))
         return history
+
+    def _render_line(self, line_dict: dict) -> Text:
+        """Render a single line with optimized style batching."""
+        line = Text()
+        current_text = ""
+        current_style = None
+
+        for char in line_dict.values():
+            char_style = self._char_style_key(char)
+            if char_style == current_style:
+                current_text += char.data or " "
+            else:
+                if current_text:
+                    line.append(current_text, style=current_style)
+                current_text = char.data or " "
+                current_style = char_style
+
+        if current_text:
+            line.append(current_text, style=current_style)
+        return line
+
+    def _char_style_key(self, char: pyte.screens.Char) -> Style | None:
+        """Get style for char, returning None for default styling."""
+        if (char.fg == "default" and char.bg == "default" and
+            not char.bold and not char.italics and not char.underscore and
+            not char.reverse and not char.strikethrough):
+            return None
+        return self._char_to_style(char, is_cursor=False)
 
     def render(self, show_cursor: bool) -> Text:
         """Convert pyte screen buffer to Rich Text with styling."""
