@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>txtmux web</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1e1e1e;
+            font-family: monospace;
+            color: #ccc;
+        }
+        #terminal {
+            width: 100%;
+            height: calc(100vh - 120px);
+        }
+        #status {
+            color: #888;
+            margin-bottom: 10px;
+        }
+        #session-picker {
+            margin-bottom: 10px;
+        }
+        #session-picker button {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 8px 16px;
+            margin-right: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            font-family: monospace;
+        }
+        #session-picker button:hover {
+            background: #444;
+        }
+        #session-picker button.new-session {
+            background: #2a5;
+            border-color: #3b6;
+        }
+        #session-picker button.new-session:hover {
+            background: #3b6;
+        }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="status">Connecting...</div>
+    <div id="session-picker" class="hidden"></div>
+    <div id="terminal"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script>
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+        });
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+
+        const status = document.getElementById('status');
+        const picker = document.getElementById('session-picker');
+        const wsUrl = 'ws://localhost:8765';
+        let ws;
+        let sessionActive = false;
+
+        const MessageType = {
+            IDENTIFY: 0,
+            NEW_SESSION: 1,
+            ATTACH: 2,
+            DETACH: 3,
+            LIST_SESSIONS: 4,
+            RESIZE: 5,
+            INPUT: 6,
+            OUTPUT: 7,
+            ERROR: 8,
+            SESSION_INFO: 9,
+            SHELL_EXITED: 10,
+        };
+
+        function encodeMessage(type, payload) {
+            const payloadBytes = payload instanceof Uint8Array ? payload : new TextEncoder().encode(payload);
+            const buffer = new ArrayBuffer(8 + payloadBytes.length);
+            const view = new DataView(buffer);
+            view.setUint32(0, type, false);
+            view.setUint32(4, payloadBytes.length, false);
+            new Uint8Array(buffer, 8).set(payloadBytes);
+            return new Uint8Array(buffer);
+        }
+
+        function encodeIdentify(width, height) {
+            const payload = new ArrayBuffer(4);
+            const view = new DataView(payload);
+            view.setUint16(0, width, false);
+            view.setUint16(2, height, false);
+            return encodeMessage(MessageType.IDENTIFY, new Uint8Array(payload));
+        }
+
+        function encodeNewSession(name) {
+            const nameBytes = new TextEncoder().encode(name);
+            const payload = new ArrayBuffer(4 + nameBytes.length);
+            const view = new DataView(payload);
+            view.setUint32(0, nameBytes.length, false);
+            new Uint8Array(payload, 4).set(nameBytes);
+            return encodeMessage(MessageType.NEW_SESSION, new Uint8Array(payload));
+        }
+
+        function encodeAttach(sessionId) {
+            const payload = new ArrayBuffer(4);
+            const view = new DataView(payload);
+            view.setUint32(0, sessionId, false);
+            return encodeMessage(MessageType.ATTACH, new Uint8Array(payload));
+        }
+
+        function encodeListSessions() {
+            return encodeMessage(MessageType.LIST_SESSIONS, new Uint8Array(0));
+        }
+
+        function encodeInput(data) {
+            return encodeMessage(MessageType.INPUT, data);
+        }
+
+        function encodeResize(width, height) {
+            const payload = new ArrayBuffer(4);
+            const view = new DataView(payload);
+            view.setUint16(0, width, false);
+            view.setUint16(2, height, false);
+            return encodeMessage(MessageType.RESIZE, new Uint8Array(payload));
+        }
+
+        function decodeMessages(buffer) {
+            const messages = [];
+            let offset = 0;
+            while (offset + 8 <= buffer.byteLength) {
+                const view = new DataView(buffer, offset);
+                const type = view.getUint32(0, false);
+                const length = view.getUint32(4, false);
+                if (offset + 8 + length > buffer.byteLength) break;
+                const payload = new Uint8Array(buffer, offset + 8, length);
+                messages.push({ type, payload });
+                offset += 8 + length;
+            }
+            return { messages, remaining: buffer.slice(offset) };
+        }
+
+        function decodeSessionInfo(payload) {
+            const view = new DataView(payload.buffer, payload.byteOffset);
+            const sessionId = view.getUint32(0, false);
+            const nameLen = view.getUint32(4, false);
+            const name = new TextDecoder().decode(payload.slice(8, 8 + nameLen));
+            let off = 8 + nameLen;
+            const paneId = view.getUint32(off, false); off += 4;
+            const pid = view.getUint32(off, false); off += 4;
+            const width = view.getUint16(off, false); off += 2;
+            const height = view.getUint16(off, false); off += 2;
+            return { sessionId, name, paneId, pid, width, height };
+        }
+
+        let recvBuffer = new ArrayBuffer(0);
+        let sessions = [];
+        let listingMode = false;
+
+        function showSessionPicker() {
+            picker.innerHTML = '';
+            picker.classList.remove('hidden');
+
+            const newBtn = document.createElement('button');
+            newBtn.className = 'new-session';
+            newBtn.textContent = '+ New Session';
+            newBtn.onclick = () => createSession();
+            picker.appendChild(newBtn);
+
+            for (const s of sessions) {
+                const btn = document.createElement('button');
+                btn.textContent = `${s.name} (${s.width}x${s.height})`;
+                btn.onclick = () => attachSession(s.sessionId);
+                picker.appendChild(btn);
+            }
+        }
+
+        function createSession() {
+            picker.classList.add('hidden');
+            const name = 'web-' + Date.now().toString(36);
+            ws.send(encodeNewSession(name));
+            listingMode = false;
+        }
+
+        function attachSession(sessionId) {
+            picker.classList.add('hidden');
+            ws.send(encodeAttach(sessionId));
+            listingMode = false;
+        }
+
+        function connect() {
+            status.textContent = 'Connecting...';
+            sessions = [];
+            listingMode = true;
+
+            try {
+                ws = new WebSocket(wsUrl);
+            } catch (e) {
+                status.textContent = 'Failed to create WebSocket: ' + e.message;
+                return;
+            }
+
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                status.textContent = 'Connected, fetching sessions...';
+                ws.send(encodeIdentify(term.cols, term.rows));
+                ws.send(encodeListSessions());
+
+                setTimeout(() => {
+                    if (listingMode) {
+                        if (sessions.length === 0) {
+                            status.textContent = 'No sessions. Creating new...';
+                            createSession();
+                        } else {
+                            status.textContent = 'Select a session:';
+                            showSessionPicker();
+                        }
+                    }
+                }, 300);
+            };
+
+            ws.onmessage = (event) => {
+                const combined = new Uint8Array(recvBuffer.byteLength + event.data.byteLength);
+                combined.set(new Uint8Array(recvBuffer), 0);
+                combined.set(new Uint8Array(event.data), recvBuffer.byteLength);
+
+                const { messages, remaining } = decodeMessages(combined.buffer);
+                recvBuffer = remaining;
+
+                for (const msg of messages) {
+                    if (msg.type === MessageType.OUTPUT) {
+                        const text = new TextDecoder().decode(msg.payload);
+                        term.write(text);
+                    } else if (msg.type === MessageType.SESSION_INFO) {
+                        const info = decodeSessionInfo(msg.payload);
+                        if (listingMode) {
+                            sessions.push(info);
+                        } else {
+                            sessionActive = true;
+                            status.textContent = `Session: ${info.name}`;
+                        }
+                    } else if (msg.type === MessageType.ERROR) {
+                        const text = new TextDecoder().decode(msg.payload);
+                        status.textContent = 'Error: ' + text;
+                    } else if (msg.type === MessageType.SHELL_EXITED) {
+                        status.textContent = 'Shell exited';
+                        sessionActive = false;
+                    }
+                }
+            };
+
+            ws.onclose = (event) => {
+                status.textContent = 'Disconnected (code: ' + event.code + '). Refresh to reconnect.';
+                sessionActive = false;
+            };
+
+            ws.onerror = () => {
+                status.textContent = 'Connection error - is server running with --bridge_port 8765?';
+            };
+        }
+
+        term.onData((data) => {
+            if (ws && ws.readyState === WebSocket.OPEN && sessionActive) {
+                ws.send(encodeInput(data));
+            }
+        });
+
+        term.onResize(({ cols, rows }) => {
+            if (ws && ws.readyState === WebSocket.OPEN && sessionActive) {
+                ws.send(encodeResize(cols, rows));
+            }
+        });
+
+        window.addEventListener('resize', () => fitAddon.fit());
+
+        connect();
+    </script>
+</body>
+</html>

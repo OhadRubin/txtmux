@@ -7,6 +7,9 @@ import signal
 import sys
 from asyncio import StreamReader, StreamWriter
 
+import websockets
+from websockets.asyncio.server import ServerConnection
+
 from txtmux.protocol import (
     Message,
     MessageType,
@@ -43,13 +46,16 @@ def get_pid_file_path() -> str:
 class SessionServer:
     """Unix domain socket server managing terminal sessions."""
 
-    def __init__(self, socket_path: str) -> None:
+    def __init__(self, socket_path: str, bridge_port: int | None = None) -> None:
         self._socket_path = socket_path
+        self._bridge_port = bridge_port
         self._session_manager: SessionManager = SessionManager()
         self._server: asyncio.Server | None = None
+        self._ws_server: websockets.asyncio.server.Server | None = None
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self._next_client_id: int = 0
         self._clients: dict[int, StreamWriter] = {}
+        self._ws_clients: dict[int, ServerConnection] = {}
         self._client_dimensions: dict[int, tuple[int, int]] = {}
         self._client_sessions: dict[int, int] = {}
         self._pty_tasks: dict[int, asyncio.Task[None]] = {}
@@ -76,6 +82,13 @@ class SessionServer:
 
         os.chmod(self._socket_path, 0o600)
 
+        if self._bridge_port is not None:
+            self._ws_server = await websockets.serve(
+                self._handle_websocket_client,
+                "0.0.0.0",
+                self._bridge_port,
+            )
+
         async with self._server:
             await self._shutdown_event.wait()
 
@@ -84,6 +97,10 @@ class SessionServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+
+        if self._ws_server is not None:
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
 
         for session_id, _ in list(self._session_manager.list_sessions()):
             session = self._session_manager.find_session(session_id=session_id, name=None)
@@ -111,6 +128,11 @@ class SessionServer:
                 pass
 
         self._clients.clear()
+
+        for ws in self._ws_clients.values():
+            await ws.close()
+
+        self._ws_clients.clear()
 
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
@@ -172,6 +194,12 @@ class SessionServer:
                         await writer.drain()
                     except Exception:
                         self._remove_dead_client(client_id)
+                ws = self._ws_clients.get(client_id)
+                if ws:
+                    try:
+                        await ws.send(output_msg.encode())
+                    except Exception:
+                        self._remove_dead_client(client_id)
 
         # Shell exited - mark pane as dead and notify clients
         pane.is_dead = True
@@ -189,6 +217,12 @@ class SessionServer:
                     await writer.drain()
                 except Exception:
                     self._remove_dead_client(client_id)
+            ws = self._ws_clients.get(client_id)
+            if ws:
+                try:
+                    await ws.send(exit_msg.encode())
+                except Exception:
+                    self._remove_dead_client(client_id)
 
     def _remove_dead_client(self, client_id: int) -> None:
         """Remove a dead client from tracking."""
@@ -199,6 +233,7 @@ class SessionServer:
             except KeyError:
                 pass
         self._clients.pop(client_id, None)
+        self._ws_clients.pop(client_id, None)
         self._client_dimensions.pop(client_id, None)
 
     def _start_pty_forwarding(self, session_id: int, pane_id: int) -> None:
@@ -207,6 +242,197 @@ class SessionServer:
             return
         task = asyncio.create_task(self._pty_forward_loop(session_id, pane_id))
         self._pty_tasks[session_id] = task
+
+    async def _handle_websocket_client(self, websocket: ServerConnection) -> None:
+        """Handle a WebSocket client connection."""
+        client_id = self._next_client_id
+        self._next_client_id += 1
+        self._ws_clients[client_id] = websocket
+
+        buffer = b""
+
+        try:
+            async for raw_message in websocket:
+                if isinstance(raw_message, str):
+                    data = raw_message.encode()
+                else:
+                    data = raw_message
+
+                buffer += data
+
+                while True:
+                    message, buffer = decode(buffer)
+                    if message is None:
+                        break
+
+                    await self._dispatch_ws_message(client_id, message, websocket)
+
+        except websockets.ConnectionClosed:
+            pass
+        except Exception as e:
+            error_msg = encode_error(str(e))
+            try:
+                await websocket.send(error_msg.encode())
+            except Exception:
+                pass
+        finally:
+            session_id = self._client_sessions.pop(client_id, None)
+            if session_id is not None:
+                self._session_manager.detach_client(session_id, client_id)
+            self._ws_clients.pop(client_id, None)
+            self._client_dimensions.pop(client_id, None)
+
+    async def _dispatch_ws_message(
+        self,
+        client_id: int,
+        message: Message,
+        websocket: ServerConnection,
+    ) -> None:
+        """Dispatch a WebSocket message to the appropriate handler."""
+        if message.msg_type == MessageType.IDENTIFY:
+            width, height = decode_identify(message.payload)
+            self._client_dimensions[client_id] = (width, height)
+
+        elif message.msg_type == MessageType.LIST_SESSIONS:
+            sessions = self._session_manager.list_sessions()
+            for session_id, name in sessions:
+                session = self._session_manager.find_session(
+                    session_id=session_id,
+                    name=None,
+                )
+                if session is None:
+                    raise RuntimeError(f"Session {session_id} not found")
+                pane = session.panes[session.active_pane_id]
+                attached_count = len(self._session_manager.get_attached_clients(session_id))
+                info_msg = encode_session_info(
+                    session_id=session.id,
+                    name=session.name,
+                    pane_id=pane.id,
+                    pid=pane.pid,
+                    width=pane.width,
+                    height=pane.height,
+                    created_at=session.created_at,
+                    attached_count=attached_count,
+                )
+                await websocket.send(info_msg.encode())
+
+        elif message.msg_type == MessageType.NEW_SESSION:
+            name = decode_new_session(message.payload)
+            if not name:
+                existing = self._session_manager.list_sessions()
+                if not existing:
+                    name = "main"
+                else:
+                    existing_names = {n for _, n in existing}
+                    i = 1
+                    while f"session-{i}" in existing_names:
+                        i += 1
+                    name = f"session-{i}"
+            dimensions = self._client_dimensions.get(client_id)
+            if dimensions is None:
+                raise RuntimeError("Client must send IDENTIFY before NEW_SESSION")
+            width, height = dimensions
+            shell = os.environ.get("SHELL", "/bin/sh")
+            session = self._session_manager.create_session(
+                name=name,
+                shell=shell,
+                width=width,
+                height=height,
+            )
+            self._session_manager.attach_client(session.id, client_id)
+            self._client_sessions[client_id] = session.id
+            pane = session.panes[session.active_pane_id]
+            self._start_pty_forwarding(session.id, pane.id)
+            attached_count = len(self._session_manager.get_attached_clients(session.id))
+            info_msg = encode_session_info(
+                session_id=session.id,
+                name=session.name,
+                pane_id=pane.id,
+                pid=pane.pid,
+                width=pane.width,
+                height=pane.height,
+                created_at=session.created_at,
+                attached_count=attached_count,
+            )
+            await websocket.send(info_msg.encode())
+
+        elif message.msg_type == MessageType.ATTACH:
+            session_id = decode_attach(message.payload)
+            session = self._session_manager.find_session(
+                session_id=session_id,
+                name=None,
+            )
+            if session is None:
+                raise RuntimeError(f"Session {session_id} not found")
+            pane = session.panes[session.active_pane_id]
+            if pane.is_dead:
+                exit_msg = encode_shell_exited(session.id, pane.id)
+                await websocket.send(exit_msg.encode())
+                return
+            self._session_manager.attach_client(session.id, client_id)
+            self._client_sessions[client_id] = session.id
+            screen_data = pane.render_to_ansi()
+            output_msg = encode_output(screen_data)
+            await websocket.send(output_msg.encode())
+            self._start_pty_forwarding(session.id, pane.id)
+            attached_count = len(self._session_manager.get_attached_clients(session.id))
+            info_msg = encode_session_info(
+                session_id=session.id,
+                name=session.name,
+                pane_id=pane.id,
+                pid=pane.pid,
+                width=pane.width,
+                height=pane.height,
+                created_at=session.created_at,
+                attached_count=attached_count,
+            )
+            await websocket.send(info_msg.encode())
+
+        elif message.msg_type == MessageType.INPUT:
+            session_id_opt: int | None = self._client_sessions.get(client_id)
+            if session_id_opt is None:
+                raise RuntimeError("Client not attached to any session")
+            session_id = session_id_opt
+            session = self._session_manager.find_session(
+                session_id=session_id,
+                name=None,
+            )
+            if session is None:
+                raise RuntimeError(f"Session {session_id} not found")
+            pane = session.panes[session.active_pane_id]
+            data = decode_input(message.payload)
+            write_pty(pane.pty_fd, data)
+
+        elif message.msg_type == MessageType.RESIZE:
+            session_id_opt = self._client_sessions.get(client_id)
+            if session_id_opt is None:
+                raise RuntimeError("Client not attached to any session")
+            session_id = session_id_opt
+            session = self._session_manager.find_session(
+                session_id=session_id,
+                name=None,
+            )
+            if session is None:
+                raise RuntimeError(f"Session {session_id} not found")
+            pane = session.panes[session.active_pane_id]
+            width, height = decode_resize(message.payload)
+            pane.width = width
+            pane.height = height
+            set_pty_size(pane.pty_fd, width, height)
+            pane.resize_screen(width, height)
+
+        elif message.msg_type == MessageType.DETACH:
+            session_id_opt = self._client_sessions.get(client_id)
+            if session_id_opt is not None:
+                session_id = session_id_opt
+                self._session_manager.detach_client(session_id, client_id)
+                del self._client_sessions[client_id]
+
+        else:
+            error_msg = encode_error(
+                f"Unhandled message type: {message.msg_type.name}"
+            )
+            await websocket.send(error_msg.encode())
 
     async def _handle_client(
         self,
@@ -448,17 +674,24 @@ def daemonize(pid_file_path: str) -> None:
         f.write(str(os.getpid()))
 
 
-async def run_server(socket_path: str) -> None:
+async def run_server(socket_path: str, bridge_port: int | None) -> None:
     """Run the session server."""
-    server = SessionServer(socket_path=socket_path)
+    server = SessionServer(socket_path=socket_path, bridge_port=bridge_port)
     await server.start()
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="txtmux session server")
+    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
+    parser.add_argument("--bridge_port", type=int, help="WebSocket bridge port")
+    args = parser.parse_args()
+
     socket_path = get_socket_path()
     pid_file = get_pid_file_path()
 
-    if "--daemon" in sys.argv:
+    if args.daemon:
         daemonize(pid_file)
 
-    asyncio.run(run_server(socket_path))
+    asyncio.run(run_server(socket_path, args.bridge_port))

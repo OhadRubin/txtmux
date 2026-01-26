@@ -73,6 +73,7 @@ Running `txtmux` without arguments creates a new session.
 │ server.py (Daemon)                                              │
 │  - SessionServer: accepts connections, dispatches messages      │
 │  - Manages PTY forwarding loops per session                     │
+│  - Optional WebSocket bridge (--bridge_port) for browser access │
 │  - Uses SessionManager from session.py                          │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
@@ -82,6 +83,13 @@ Running `txtmux` without arguments creates a new session.
 │  - Pane: id, pty_fd, pid, pyte.HistoryScreen                    │
 │  - SessionManager: create/destroy/attach/detach                 │
 └─────────────────────────────────────────────────────────────────┘
+
+Browser clients connect via WebSocket when --bridge_port is set:
+
+┌─────────────┐     WebSocket      ┌─────────────────────────────┐
+│   Browser   │ ◄────────────────► │       server.py             │
+│  (xterm.js) │     :8765          │  (same binary protocol)     │
+└─────────────┘                    └─────────────────────────────┘
 ```
 
 **Protocol** (`protocol.py`): Binary messages with 8-byte header (type: u32, length: u32) + payload.
@@ -103,6 +111,25 @@ txtmux implements a minimal subset of tmux functionality:
 | Configuration file | No | Yes |
 | Mouse support | No | Yes |
 
+## Web Interface
+
+txtmux includes a WebSocket bridge for browser access:
+
+```bash
+# Start server with WebSocket bridge
+uv run python -m txtmux.server --bridge_port 8765
+
+# Serve the web client
+cd web && python -m http.server 8000
+
+# Open http://localhost:8000 in your browser
+```
+
+The web client uses [xterm.js](https://xtermjs.org/) and supports:
+- Session selection (pick existing or create new)
+- Full terminal emulation
+- Keyboard input and resize
+
 ## Development
 
 ```bash
@@ -114,6 +141,9 @@ uv run mypy --strict src/txtmux/
 
 # Run server in foreground (for debugging)
 uv run python -m txtmux.server
+
+# Run server with WebSocket bridge
+uv run python -m txtmux.server --bridge_port 8765
 
 # Clean up socket files
 rm -rf /tmp/textual-tmux-*/

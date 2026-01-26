@@ -12,13 +12,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 src/txtmux/          # Main package
   cli.py             # CLI entry point
   client.py          # Textual TUI app
-  server.py          # Daemon server
+  server.py          # Daemon server (Unix socket + optional WebSocket bridge)
   session.py         # Session/Pane management
   protocol.py        # Binary protocol
   pty_handler.py     # PTY operations
   terminal_widget.py # Terminal widget
 tests/               # Test files
 docs/                # Plans and docs
+web/                 # Browser client (xterm.js)
+  index.html         # Single-file web terminal
 ```
 
 ## Commands
@@ -48,6 +50,13 @@ uv run python -m txtmux
 uv run python -m txtmux.server           # foreground
 uv run python -m txtmux.server --daemon  # background
 
+# Run server with WebSocket bridge for browser access
+uv run python -m txtmux.server --bridge_port 8765
+
+# Serve web client
+cd web && python -m http.server 8000
+# Then open http://localhost:8000
+
 # Clean up
 txtmux kill-server
 rm -rf /tmp/textual-tmux-*/
@@ -72,6 +81,7 @@ rm -rf /tmp/textual-tmux-*/
 │ server.py (Daemon)                                              │
 │  - SessionServer: accepts connections, dispatches messages      │
 │  - Manages PTY forwarding loops per session                     │
+│  - Optional WebSocket bridge (--bridge_port) for browser access │
 │  - Uses SessionManager from session.py                          │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
@@ -92,6 +102,8 @@ rm -rf /tmp/textual-tmux-*/
 - Network mode: sends INPUT/RESIZE messages, receives OUTPUT
 
 **PTY Handler** (`pty_handler.py`): Low-level PTY operations - spawn_shell(), read_pty(), write_pty(), set_pty_size()
+
+**Web Client** (`web/index.html`): Browser-based terminal using xterm.js, connects via WebSocket to the server's bridge port. Supports session listing, creation, and attachment.
 
 ## Socket Location
 
